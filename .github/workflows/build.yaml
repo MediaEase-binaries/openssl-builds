@@ -1,0 +1,247 @@
+name: Build OpenSSL
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'OpenSSL version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '3.0.15'
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generating matrix
+        id: generate
+        run: |
+          pip3 install --upgrade pyyaml
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.version }} (${{ matrix.os }})
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 2
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || matrix.os == 'debian-12' && 'debian:bookworm' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'noble' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMMITTER_NAME: ${{ secrets.COMMITTER_NAME }}
+      COMMITTER_EMAIL: ${{ secrets.COMMITTER_EMAIL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
+
+      - name: Setup variables
+        id: vars
+        run: |
+          echo "build_script=tools/packages/openssl/build.sh" >> $GITHUB_OUTPUT
+          echo "package_name=openssl" >> $GITHUB_OUTPUT
+          echo "metadata_script=tools/generate_metadata.sh" >> $GITHUB_OUTPUT
+          echo "control_file=tools/packages/openssl/control" >> $GITHUB_OUTPUT
+          echo "package_script=tools/generate_package.sh" >> $GITHUB_OUTPUT
+          echo "temp_dir=/tmp/openssl-build/install" >> $GITHUB_OUTPUT
+          for script in $(find tools/ -name "*.sh"); do
+            chmod +x $script
+          done
+
+      - name: Update APT
+        run: |
+          upx="upx-ucl"
+          if [ "${{ matrix.os }}" = "debian-12" ]; then
+            echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list
+            upx="upx-ucl/bookworm-backports"
+          fi
+          apt-get update
+          apt-get install -y --no-install-recommends apt-transport-https rsync lsb-release curl wget git gzip util-linux \
+            dirmngr software-properties-common gnupg2 ca-certificates gpg-agent dos2unix nfs-common \
+            jq sudo debconf-utils build-essential checkinstall libnss3-tools nano zip \
+            unzip ssl-cert cmake patchelf $upx autoconf-archive libssl-dev debian-keyring debian-archive-keyring pkg-config ninja-build
+
+      - name: Build OpenSSL
+        run: |
+          for control_file in $(find tools/packages/openssl -name "*.control"); do
+            sed -i "s/@VERSION@/${{ matrix.version }}/" $control_file
+            sed -i "s/@MAINTAINER@/${{ secrets.COMMITTER_NAME }} <${{ secrets.COMMITTER_EMAIL }}>/" $control_file
+            sed -i "s/@ARCHITECTURE@/amd64/" $control_file
+          done
+          ./${{ steps.vars.outputs.build_script }} ${{ matrix.version }}
+
+      - name: Generate metadata
+        run: |
+          mkdir -p artifacts
+          cd artifacts
+          distro=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          codename=$(lsb_release -cs)
+          os="$distro-$codename"
+          find / -name "*.deb" | while read -r deb_file; do
+            pkg_name=$(basename "$deb_file" | cut -d_ -f1)
+            new_deb_file="${pkg_name}_${{ matrix.version }}-1build1_${os}_amd64.deb"
+            echo "Generating metadata for DEB file: $deb_file"
+            ../${{ steps.vars.outputs.metadata_script }} \
+              --category "openssl" \
+              --version "${{ matrix.version }}" \
+              --os "${codename}" \
+              "$deb_file"
+            mv "$deb_file" "$new_deb_file"
+            echo "Created metadata for: $new_deb_file"
+            ls -l "$(basename "$deb_file" .deb).json"
+          done
+
+      - name: Upload as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-${{ matrix.version }}-${{ matrix.os }}
+          path: artifacts/*
+          retention-days: 7
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        version: ['3.0.15']
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          pattern: openssl-${{ matrix.version }}*
+      
+      - name: Prepare release assets
+        id: prepare-release-assets
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \
+            \( -name "*${{ matrix.version }}*.deb" -o \
+              -name "*${{ matrix.version }}*.json" \) \
+            -exec cp {} release_assets/ \;
+          
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          CONFIG_TABLE="$TEMP_DIR/config.md"
+          
+          {
+            echo "| Package | OS | Version |"
+            echo "| ------- | -- | ------- |"
+            for f in release_assets/*.deb; do
+              if [ -f "$f" ]; then
+                pkg=$(basename "$f")
+                os=$(echo "$pkg" | grep -o "debian-[^ _]*\|ubuntu-[^ _]*" || echo "unknown")
+                echo "| $pkg | $os | ${{ matrix.version }} |"
+              fi
+            done
+          } > "$PACKAGES_TABLE"
+
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          PREFIX="/usr"
+          {
+            openssl_configure='./Configure shared --prefix="/usr" --openssldir="/usr/lib/ssl" --libdir="/usr/lib" -DBUILD_SHARED_LIBS=ON'
+            echo "| Configure Options |"
+            echo "| ------------------- |"
+            echo "| \`${openssl_configure}\` |"
+          } > "$CONFIG_TABLE"
+          echo "config_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$CONFIG_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          rm -rf "$TEMP_DIR"
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: OpenSSL ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          generate_release_notes: true
+          body: |
+            # OpenSSL v${{ matrix.version }}
+
+            Pre-built OpenSSL packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled OpenSSL libraries
+            - Multiple distribution support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+            - Optimized for MediaEase applications
+
+            ## 📦 Available Packages
+
+            ${{ steps.prepare-release-assets.outputs.packages_table }}
+
+            ## 🔧 Build Configuration
+
+            ${{ steps.prepare-release-assets.outputs.config_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            ## 📄 Metadata
+
+            Each package is accompanied by its JSON metadata file containing:
+            - Package information
+            - Checksums
+            - Dependencies
+            - Build configuration
+            - Distribution details
+
+            ## 📝 License
+
+            OpenSSL is distributed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
